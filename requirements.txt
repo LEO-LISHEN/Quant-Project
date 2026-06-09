@@ -1,0 +1,5 @@
+pandas>=2.0
+pyarrow>=14.0
+python-dotenv>=1.0
+tushare>=1.2.89
+futu-api>=9.4

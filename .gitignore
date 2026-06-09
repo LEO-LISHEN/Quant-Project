@@ -1,0 +1,15 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+
+database/metadata/cache/
+
+base_layer/
+research/**/temp/
+research/**/outputs/
+
+*.parquet
