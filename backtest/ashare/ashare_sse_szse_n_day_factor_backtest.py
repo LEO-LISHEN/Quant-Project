@@ -22,6 +22,7 @@ BACKTEST_REQUIRED_COLUMNS = {
     "trade_date",
     "open",
     "close",
+    "adj_factor",
     "can_buy_open",
     "can_sell_open",
     "is_suspended",
@@ -55,9 +56,10 @@ class NDayFactorBacktestConfig:
 class Holding:
     """Mutable holding state."""
 
-    shares: int
+    shares: float
     last_buy_date: str
     last_price: float
+    last_adj_factor: float
 
 
 def _normalize_date(date_text: str | None) -> str | None:
@@ -158,7 +160,7 @@ def _prepare_backtest_base(
         prepared = prepared[prepared["trade_date"] <= config.end_date].copy()
     if prepared.duplicated(["ts_code", "trade_date"]).any():
         raise ValueError("`backtest_base` contains duplicate (`ts_code`, `trade_date`) rows.")
-    for column in ("open", "close"):
+    for column in ("open", "close", "adj_factor"):
         prepared[column] = pd.to_numeric(prepared[column], errors="coerce")
     for column in ("can_buy_open", "can_sell_open", "is_suspended"):
         prepared[column] = prepared[column].fillna(False).astype(bool)
@@ -186,6 +188,34 @@ def _valid_price(value: Any) -> bool:
         return pd.notna(value) and float(value) > 0
     except (TypeError, ValueError):
         return False
+
+
+def _valid_adj_factor(value: Any) -> bool:
+    try:
+        return pd.notna(value) and float(value) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _row_adj_factor(row: pd.Series | None) -> float | None:
+    if row is None:
+        return None
+    value = row.get("adj_factor")
+    if _valid_adj_factor(value):
+        return float(value)
+    return None
+
+
+def _adjust_holding_for_corporate_action(row: pd.Series | None, holding: Holding) -> None:
+    current_adj_factor = _row_adj_factor(row)
+    if current_adj_factor is None or not _valid_adj_factor(holding.last_adj_factor):
+        return
+    ratio = current_adj_factor / holding.last_adj_factor
+    if ratio <= 0:
+        return
+    if abs(ratio - 1.0) > 1e-12:
+        holding.shares *= ratio
+        holding.last_adj_factor = current_adj_factor
 
 
 def _open_or_last_price(row: pd.Series | None, holding: Holding) -> float:
@@ -348,6 +378,7 @@ def _portfolio_value_at_open(
     stock_value = 0.0
     for ts_code, holding in holdings.items():
         row = _get_row(date_frame, ts_code)
+        _adjust_holding_for_corporate_action(row, holding)
         price = _open_or_last_price(row, holding)
         value = holding.shares * price
         current_values[ts_code] = value
@@ -361,7 +392,7 @@ def _execute_sell(
     trade_date: str,
     signal_date: str,
     ts_code: str,
-    shares: int,
+    shares: float,
     price: float,
     cash: float,
     holding: Holding,
@@ -402,17 +433,24 @@ def _execute_buy(
     buy_cost_rate: float,
     trades: list[dict[str, Any]],
     reason: str,
+    adj_factor: float,
 ) -> float:
     amount = shares * price
     cost = amount * buy_cost_rate
     cash -= amount + cost
     holding = holdings.get(ts_code)
     if holding is None:
-        holdings[ts_code] = Holding(shares=shares, last_buy_date=trade_date, last_price=price)
+        holdings[ts_code] = Holding(
+            shares=float(shares),
+            last_buy_date=trade_date,
+            last_price=price,
+            last_adj_factor=adj_factor,
+        )
     else:
         holding.shares += shares
         holding.last_buy_date = trade_date
         holding.last_price = price
+        holding.last_adj_factor = adj_factor
     trades.append(
         {
             "trade_date": trade_date,
@@ -485,7 +523,7 @@ def _rebalance(
             trade_date=trade_date,
             signal_date=signal_date,
             ts_code=ts_code,
-            shares=int(sell_shares),
+            shares=sell_shares,
             price=price,
             cash=cash,
             holding=holding,
@@ -501,7 +539,7 @@ def _rebalance(
                 "action": "sell",
                 "status": "filled",
                 "reason": reason,
-                "shares": int(sell_shares),
+                "shares": sell_shares,
                 "target_weight": target_weights.get(ts_code, 0.0),
                 "current_value": current_value,
                 "target_value": target_value,
@@ -571,6 +609,7 @@ def _rebalance(
             buy_cost_rate=config.buy_cost_rate,
             trades=trades,
             reason="buy_underweight_or_new_target",
+            adj_factor=_row_adj_factor(row) or 1.0,
         )
         logs.append(
             {
@@ -607,6 +646,7 @@ def _liquidate_positions(
     for ts_code in list(holdings.keys()):
         holding = holdings[ts_code]
         row = _get_row(date_frame, ts_code)
+        _adjust_holding_for_corporate_action(row, holding)
         can_sell, block_reason = _can_sell(row, trade_date, holding)
         current_value = holding.shares * _open_or_last_price(row, holding)
         if not can_sell:
@@ -671,9 +711,13 @@ def _value_portfolio_at_close(
     holding_values: dict[str, tuple[float, float]] = {}
     for ts_code, holding in holdings.items():
         row = _get_row(date_frame, ts_code)
+        _adjust_holding_for_corporate_action(row, holding)
         price = _close_or_last_price(row, holding)
         if row is not None and _valid_price(row.get("close")):
             holding.last_price = price
+        current_adj_factor = _row_adj_factor(row)
+        if current_adj_factor is not None:
+            holding.last_adj_factor = current_adj_factor
         value = holding.shares * price
         stock_value += value
         holding_values[ts_code] = (price, value)
